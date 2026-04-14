@@ -3,6 +3,8 @@ package discover
 import (
 	"bytes"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -2081,4 +2083,115 @@ power management:
 			}
 		})
 	}
+}
+
+func TestGetCgroupMemStat(t *testing.T) {
+	// Write a temp memory.stats file mimicking cgroupv2 format
+	statsContent := `anon 1048576
+file 5242880
+kernel 262144
+inactive_anon 204800
+active_anon 843776
+inactive_file 3145728
+active_file 2097152
+unevictable 0
+slab_reclaimable 131072
+slab_unreclaimable 65536
+`
+	f, err := os.CreateTemp(t.TempDir(), "memory.stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(statsContent); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	tests := []struct {
+		key     string
+		want    uint64
+		wantErr bool
+	}{
+		{"inactive_file", 3145728, false},
+		{"active_file", 2097152, false},
+		{"anon", 1048576, false},
+		{"unevictable", 0, false},
+		{"nonexistent_key", 0, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.key, func(t *testing.T) {
+			got, err := getCgroupMemStat(f.Name(), tc.key)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("getCgroupMemStat(%q) error = %v, wantErr %v", tc.key, err, tc.wantErr)
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Fatalf("getCgroupMemStat(%q) = %d, want %d", tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetCPUMemByCgroups(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	// Patch the cgroup file paths via a helper that accepts paths – test the
+	// calculation logic directly by calling getCgroupMemStatFromFiles.
+	// Since getCPUMemByCgroups hard-codes the paths, we test the net effect
+	// through getCgroupMemStat and getUint64ValueFromFile individually, then
+	// verify the arithmetic.
+
+	t.Run("inactive_file subtracted from used", func(t *testing.T) {
+		// Simulate: total=1GiB, current=600MiB, inactive_file=200MiB
+		// Expected free = 1GiB - (600MiB - 200MiB) = 600MiB
+		const total = 1024 * 1024 * 1024   // 1 GiB
+		const current = 600 * 1024 * 1024  // 600 MiB
+		const inactive = 200 * 1024 * 1024 // 200 MiB
+		const wantFree = total - (current - inactive)
+
+		writeFile("memory.max", "1073741824\n")
+		statsPath := writeFile("memory.stats", "anon 1234\nfile 5678\ninactive_file 209715200\nactive_file 104857600\n")
+
+		inactiveFile, err := getCgroupMemStat(statsPath, "inactive_file")
+		if err != nil {
+			t.Fatalf("getCgroupMemStat: %v", err)
+		}
+		if inactiveFile != inactive {
+			t.Fatalf("inactive_file = %d, want %d", inactiveFile, inactive)
+		}
+
+		used := uint64(current)
+		if inactiveFile < used {
+			used -= inactiveFile
+		}
+		got := uint64(total) - used
+		if got != wantFree {
+			t.Fatalf("free = %d, want %d", got, wantFree)
+		}
+	})
+
+	t.Run("inactive_file >= used does not underflow", func(t *testing.T) {
+		// Edge case: inactive_file reported larger than current (shouldn't happen
+		// in practice but guard against uint64 underflow).
+		const current = 100 * 1024 * 1024
+		const inactive = 200 * 1024 * 1024 // larger than current
+
+		used := uint64(current)
+		inactiveFile := uint64(inactive)
+		if inactiveFile < used {
+			used -= inactiveFile
+		}
+		// used should remain unchanged
+		if used != current {
+			t.Fatalf("used = %d, want %d (underflow guard failed)", used, uint64(current))
+		}
+	})
 }

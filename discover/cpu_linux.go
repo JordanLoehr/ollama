@@ -73,9 +73,36 @@ func getCPUMemByCgroups(mem memInfo) memInfo {
 	}
 	used, err := getUint64ValueFromFile("/sys/fs/cgroup/memory.current")
 	if err == nil {
+		// Subtract inactive file-backed memory (reclaimable page cache) from the
+		// used count to approximate MemAvailable, matching what Kubernetes does.
+		// memory.current includes reclaimable page cache which the kernel will
+		// free under pressure, so counting it as "used" causes free memory to be
+		// drastically underreported in containers.
+		if inactiveFile, statsErr := getCgroupMemStat("/sys/fs/cgroup/memory.stats", "inactive_file"); statsErr == nil && inactiveFile < used {
+			used -= inactiveFile
+		}
 		mem.FreeMemory = mem.TotalMemory - used
 	}
 	return mem
+}
+
+// getCgroupMemStat reads a named field from a cgroupv2 memory.stats file.
+// The file contains lines of the form "<key> <value>".
+func getCgroupMemStat(path, key string) (uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	prefix := key + " "
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := s.Text()
+		if strings.HasPrefix(line, prefix) {
+			return strconv.ParseUint(strings.TrimPrefix(line, prefix), 10, 64)
+		}
+	}
+	return 0, fmt.Errorf("key %q not found in %s", key, path)
 }
 
 func getUint64ValueFromFile(path string) (uint64, error) {
